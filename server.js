@@ -3,6 +3,11 @@ import multer from 'multer';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import fs from 'fs/promises';
+import { createWriteStream } from 'fs';
+import { pipeline } from 'stream/promises';
+import { Readable } from 'stream';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { parse as csvParse } from 'csv-parse/sync';
@@ -15,6 +20,7 @@ const DB_FILE = path.join(DATA_DIR, 'knowledge.json');
 const INDEX_FILE = path.join(DATA_DIR, 'index.json');
 const PORT = Number(process.env.PORT || 3000);
 const app = express();
+const execFileAsync = promisify(execFile);
 const upload = multer({ dest: path.join(DATA_DIR, 'uploads'), limits: { fileSize: 25 * 1024 * 1024 } });
 app.use(express.json({ limit: '2mb' }));
 app.use(cookieParser());
@@ -65,6 +71,30 @@ function toEntries(name, text, ext) {
   return chunks.map(content => ({ id:id(), source:name, type:'document', question:'', answer:'', content:content.slice(0, 5000) }));
 }
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+async function fetchHfJson(url, label) {
+  // Dataset Viewer membatasi burst request. Retry agar import panjang tidak mati di tengah.
+  let lastStatus = '';
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      const response = await fetch(url, { headers: { 'User-Agent': 'AI-Knowledge-Hub/1.0', 'Accept': 'application/json' } });
+      if (response.ok) return response.json();
+      lastStatus = `HTTP ${response.status}`;
+      const retryable = [429, 500, 502, 503, 504].includes(response.status);
+      if (!retryable) {
+        const body = await response.text().catch(() => '');
+        throw new Error(`${label} ditolak oleh Hugging Face (${lastStatus}). ${body.slice(0, 160)}`);
+      }
+      const retryAfter = Number(response.headers.get('retry-after'));
+      await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : Math.min(15000, 700 * 2 ** attempt));
+    } catch (error) {
+      if (attempt === 7) throw new Error(`${label} gagal setelah 8 percobaan (${lastStatus || error.message}).`);
+      if (lastStatus) continue;
+      await sleep(Math.min(15000, 700 * 2 ** attempt));
+    }
+  }
+  throw new Error(`${label} gagal (${lastStatus}).`);
+}
 function hfDatasetId(value = '') {
   const clean = value.trim().replace(/\/$/, '');
   const match = clean.match(/huggingface\.co\/datasets\/([^/?#]+\/[^/?#]+)/i);
@@ -74,9 +104,10 @@ function hfDatasetId(value = '') {
 }
 async function importHuggingFace(datasetInput) {
   const dataset = hfDatasetId(datasetInput);
-  const splitsResponse = await fetch(`https://datasets-server.huggingface.co/splits?dataset=${encodeURIComponent(dataset)}`);
-  if (!splitsResponse.ok) throw new Error('Dataset tidak dapat diakses dari Hugging Face. Pastikan dataset bersifat publik dan gunakan dataset ID yang benar.');
-  const splitData = await splitsResponse.json();
+  const splitData = await fetchHfJson(
+    `https://datasets-server.huggingface.co/splits?dataset=${encodeURIComponent(dataset)}`,
+    'Metadata dataset'
+  );
   const target = splitData.splits?.find(s => s.split === 'train') || splitData.splits?.[0];
   if (!target) throw new Error('Hugging Face tidak menyediakan split yang dapat diimpor untuk dataset ini.');
   const rows = [];
@@ -89,16 +120,56 @@ async function importHuggingFace(datasetInput) {
     url.searchParams.set('split', target.split);
     url.searchParams.set('offset', String(offset));
     url.searchParams.set('length', '100');
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`Gagal mengambil data Hugging Face pada baris ${offset}. Dataset mungkin gated atau viewer API tidak mendukung dataset ini.`);
-    const page = await response.json();
+    const page = await fetchHfJson(url, `Pengambilan data pada baris ${offset}`);
     const pageRows = (page.rows || []).map(item => item.row || item);
     rows.push(...pageRows);
     if (pageRows.length < 100) break;
+    // Sedikit jeda agar Hugging Face tidak memberi rate limit pada import panjang.
+    await sleep(90);
   }
   const entries = toEntries(`HF:${dataset}`, JSON.stringify(rows), '.json');
   if (!entries.length) throw new Error('Dataset berhasil diambil, tetapi format kolomnya bukan Q&A yang dikenali. Dataset harus memiliki question/answer, prompt/completion, atau input/output.');
   return { dataset, entries, downloaded: rows.length, config: target.config, split: target.split };
+}
+
+async function downloadParquet(url, destination) {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const response = await fetch(url, { headers: { 'User-Agent': 'AI-Knowledge-Hub/1.0' } });
+    if (response.ok && response.body) {
+      await pipeline(Readable.fromWeb(response.body), createWriteStream(destination));
+      return;
+    }
+    if (![429, 500, 502, 503, 504].includes(response.status)) throw new Error(`File dataset tidak bisa diunduh (HTTP ${response.status}).`);
+    await sleep(Math.min(60000, 1500 * 2 ** attempt));
+  }
+  throw new Error('File dataset tetap terkena rate limit Hugging Face setelah beberapa percobaan.');
+}
+async function importHuggingFaceParquet(datasetInput) {
+  const dataset = hfDatasetId(datasetInput);
+  // Mengambil daftar file asli langsung dari repository, tidak melalui Dataset Viewer
+  // yang memberi HTTP 429 saat membaca ribuan halaman.
+  const tree = await fetchHfJson(`https://huggingface.co/api/datasets/${dataset}/tree/main?recursive=true&expand=false`, 'Daftar file dataset');
+  const parquetFiles = tree.filter(file => file.type === 'file' && file.path.endsWith('.parquet'));
+  if (!parquetFiles.length) return importHuggingFace(dataset);
+  const jobDir = path.join(DATA_DIR, 'uploads', `hf-${Date.now()}`);
+  await fs.mkdir(jobDir, { recursive: true });
+  try {
+    const localFiles = [];
+    for (let index = 0; index < parquetFiles.length; index++) {
+      const file = parquetFiles[index];
+      const local = path.join(jobDir, `${index}.parquet`);
+      await downloadParquet(`https://huggingface.co/datasets/${dataset}/resolve/main/${file.path}?download=true`, local);
+      localFiles.push(local);
+    }
+    try { await execFileAsync('python3', ['-c', 'import pyarrow'], { timeout: 30000 }); }
+    catch { await execFileAsync('python3', ['-m', 'pip', 'install', '--user', 'pyarrow'], { timeout: 300000, maxBuffer: 1024 * 1024 }); }
+    const resultFile = path.join(jobDir, 'rows.json');
+    await execFileAsync('python3', [path.join(__dirname, 'hf_parquet_to_json.py'), resultFile, ...localFiles], { timeout: 1800000, maxBuffer: 1024 * 1024 });
+    const raw = await fs.readFile(resultFile, 'utf8');
+    const entries = toEntries(`HF:${dataset}`, raw, '.json');
+    if (!entries.length) throw new Error('Dataset berhasil diunduh, tetapi tidak memiliki kolom Q&A yang dikenali.');
+    return { dataset, entries, downloaded: JSON.parse(raw).length, config: 'repository-parquet', split: 'all parquet files' };
+  } finally { await fs.rm(jobDir, { recursive: true, force: true }); }
 }
 
 app.get('/api/status', async (req,res) => { const data=await db(); res.json({ admin:isAdmin(req), datasets:data.datasets, entries:data.entries.length, training:data.training }); });
@@ -109,7 +180,7 @@ app.post('/api/train', requireAdmin, async (req,res) => { const data=await db();
 app.post('/api/datasets', requireAdmin, upload.single('file'), async (req,res) => { if(!req.file) return res.status(400).json({error:'Pilih file dataset.'}); const ext=path.extname(req.file.originalname).toLowerCase(); if(!['.txt','.md','.csv','.json'].includes(ext)) return res.status(400).json({error:'Format yang didukung: TXT, MD, CSV, JSON.'}); try { const text=await fs.readFile(req.file.path,'utf8'); const entries=toEntries(req.file.originalname,text,ext); if(!entries.length) throw new Error('Tidak ada data valid. CSV/JSON perlu kolom question dan answer (atau pertanyaan dan jawaban).'); const data=await db(); data.entries.push(...entries); data.datasets.unshift({id:id(),name:req.file.originalname,type:ext.slice(1).toUpperCase(),count:entries.length,createdAt:new Date().toISOString()}); data.training={status:'Perlu dilatih ulang',updatedAt:data.training.updatedAt}; await write(DB_FILE,data); res.json({ok:true,count:entries.length}); } catch(e) { res.status(400).json({error:e.message}); } finally { await fs.unlink(req.file.path).catch(()=>{}); } });
 app.post('/api/datasets/huggingface', requireAdmin, async (req,res) => {
   try {
-    const imported = await importHuggingFace(String(req.body.dataset || ''));
+    const imported = await importHuggingFaceParquet(String(req.body.dataset || ''));
     const data = await db();
     data.entries.push(...imported.entries);
     data.datasets.unshift({ id:id(), name:`HF:${imported.dataset}`, type:'HUGGING FACE', count:imported.entries.length, createdAt:new Date().toISOString(), config:imported.config, split:imported.split });
