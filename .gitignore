@@ -1,0 +1,5 @@
+node_modules/
+.env
+data/knowledge.json
+data/index.json
+data/uploads/
