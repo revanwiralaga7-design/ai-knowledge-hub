@@ -36,7 +36,9 @@ function isAdmin(req) { return req.cookies.ai_admin === process.env.SESSION_SECR
 function requireAdmin(req, res, next) { if (!isAdmin(req)) return res.status(401).json({ error: 'Login admin diperlukan.' }); next(); }
 
 function makeIndex(entries) {
-  const docs = entries.map(e => tokenize(`${e.question || ''} ${e.answer || ''} ${e.content || ''}`));
+  // Untuk Q&A, cocokkan pertanyaan/instruction saja. Mengindeks source code pada
+  // jawaban membuat kata pendek seperti "hi" salah cocok ke nama function seperti hi_it.
+  const docs = entries.map(e => tokenize(`${e.question || ''} ${e.content || ''}`));
   const df = {};
   docs.forEach(words => new Set(words).forEach(w => { df[w] = (df[w] || 0) + 1; }));
   const n = Math.max(docs.length, 1);
@@ -175,7 +177,21 @@ async function importHuggingFaceParquet(datasetInput) {
 app.get('/api/status', async (req,res) => { const data=await db(); res.json({ admin:isAdmin(req), datasets:data.datasets, entries:data.entries.length, training:data.training }); });
 app.post('/api/login', (req,res) => { if (!process.env.ADMIN_PASSWORD || req.body.password !== process.env.ADMIN_PASSWORD) return res.status(401).json({error:'Password salah.'}); res.cookie('ai_admin', process.env.SESSION_SECRET, { httpOnly:true, sameSite:'lax', secure:false, maxAge: 86400000 }); res.json({ok:true}); });
 app.post('/api/logout', (req,res) => { res.clearCookie('ai_admin'); res.json({ok:true}); });
-app.post('/api/chat', async (req,res) => { const message=String(req.body.message || '').trim(); if (!message) return res.status(400).json({error:'Tulis pesan terlebih dahulu.'}); const data=await db(), index=await read(INDEX_FILE, {}), result=search(message,data,index); if (!result) return res.json({answer:'Saya belum menemukan jawaban yang cukup relevan pada dataset. Coba gunakan pertanyaan lain atau minta admin menambahkan data.', confidence:0, source:null}); const e=result.entry; const answer=e.answer || e.content; res.json({answer, confidence:Math.round(result.score*100), source:e.source}); });
+app.post('/api/chat', async (req,res) => {
+  const message=String(req.body.message || '').trim();
+  if (!message) return res.status(400).json({error:'Tulis pesan terlebih dahulu.'});
+  const normalized = message.toLowerCase().replace(/[^a-z\s]/g, '').trim();
+  if (['hi','hello','halo','hai','hey','pagi','siang','malam'].includes(normalized)) {
+    return res.json({answer:'Halo! Saya asisten coding. Tanyakan masalah coding, konsep pemrograman, atau minta contoh kode yang ingin Anda pelajari.', confidence:100, source:'System greeting'});
+  }
+  if (tokenize(message).length < 2) {
+    return res.json({answer:'Coba tulis pertanyaan yang sedikit lebih spesifik. Contoh: “Apa perbedaan let dan const di JavaScript?”', confidence:0, source:null});
+  }
+  const data=await db(), index=await read(INDEX_FILE, {}), result=search(message,data,index);
+  if (!result) return res.json({answer:'Saya belum menemukan jawaban yang cukup relevan pada dataset. Coba gunakan pertanyaan coding yang lebih spesifik atau tambahkan dataset yang sesuai.', confidence:0, source:null});
+  const e=result.entry; const answer=e.answer || e.content;
+  res.json({answer, confidence:Math.round(result.score*100), source:e.source});
+});
 app.post('/api/train', requireAdmin, async (req,res) => { const data=await db(); data.training={status:'Melatih indeks AI...',updatedAt:new Date().toISOString()}; await write(DB_FILE,data); const index=makeIndex(data.entries); await write(INDEX_FILE,index); data.training={status:'Siap digunakan',updatedAt:new Date().toISOString(),model:'TF-IDF retrieval model (from scratch)'}; await write(DB_FILE,data); res.json({ok:true, entries:data.entries.length}); });
 app.post('/api/datasets', requireAdmin, upload.single('file'), async (req,res) => { if(!req.file) return res.status(400).json({error:'Pilih file dataset.'}); const ext=path.extname(req.file.originalname).toLowerCase(); if(!['.txt','.md','.csv','.json'].includes(ext)) return res.status(400).json({error:'Format yang didukung: TXT, MD, CSV, JSON.'}); try { const text=await fs.readFile(req.file.path,'utf8'); const entries=toEntries(req.file.originalname,text,ext); if(!entries.length) throw new Error('Tidak ada data valid. CSV/JSON perlu kolom question dan answer (atau pertanyaan dan jawaban).'); const data=await db(); data.entries.push(...entries); data.datasets.unshift({id:id(),name:req.file.originalname,type:ext.slice(1).toUpperCase(),count:entries.length,createdAt:new Date().toISOString()}); data.training={status:'Perlu dilatih ulang',updatedAt:data.training.updatedAt}; await write(DB_FILE,data); res.json({ok:true,count:entries.length}); } catch(e) { res.status(400).json({error:e.message}); } finally { await fs.unlink(req.file.path).catch(()=>{}); } });
 app.post('/api/datasets/huggingface', requireAdmin, async (req,res) => {
