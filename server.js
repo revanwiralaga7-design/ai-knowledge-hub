@@ -112,9 +112,11 @@ app.post('/api/datasets/huggingface', requireAdmin, async (req,res) => {
     const data = await db();
     data.entries.push(...imported.entries);
     data.datasets.unshift({ id:id(), name:`HF:${imported.dataset}`, type:'HUGGING FACE', count:imported.entries.length, createdAt:new Date().toISOString(), config:imported.config, split:imported.split });
-    data.training={status:'Perlu dilatih ulang',updatedAt:data.training.updatedAt};
+    // Import dari Hugging Face langsung membangun ulang model agar satu link cukup.
+    await write(INDEX_FILE, makeIndex(data.entries));
+    data.training={status:'Siap digunakan',updatedAt:new Date().toISOString(),model:'TF-IDF retrieval model (from scratch)'};
     await write(DB_FILE,data);
-    res.json({ok:true, count:imported.entries.length, downloaded:imported.downloaded, dataset:imported.dataset});
+    res.json({ok:true, count:imported.entries.length, downloaded:imported.downloaded, dataset:imported.dataset, trained:true});
   } catch (error) { res.status(400).json({error:error.message}); }
 });
 app.get('/api/export/jsonl', requireAdmin, async (req,res) => { const data=await db(); const lines=data.entries.filter(e=>e.question&&e.answer).map(e=>JSON.stringify({messages:[{role:'user',content:e.question},{role:'assistant',content:e.answer}]})).join('\n'); res.setHeader('Content-Type','application/jsonl'); res.setHeader('Content-Disposition','attachment; filename=training-dataset.jsonl'); res.send(lines); });
