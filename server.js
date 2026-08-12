@@ -72,24 +72,25 @@ function hfDatasetId(value = '') {
   if (!/^[\w.-]+\/[\w.-]+$/.test(candidate)) throw new Error('Masukkan link atau ID dataset Hugging Face yang valid, misalnya HuggingFaceH4/CodeAlpaca_20K.');
   return candidate;
 }
-async function importHuggingFace(datasetInput, requestedLimit) {
+async function importHuggingFace(datasetInput) {
   const dataset = hfDatasetId(datasetInput);
-  const limit = Math.min(Math.max(Number(requestedLimit) || 1000, 1), 5000);
   const splitsResponse = await fetch(`https://datasets-server.huggingface.co/splits?dataset=${encodeURIComponent(dataset)}`);
   if (!splitsResponse.ok) throw new Error('Dataset tidak dapat diakses dari Hugging Face. Pastikan dataset bersifat publik dan gunakan dataset ID yang benar.');
   const splitData = await splitsResponse.json();
   const target = splitData.splits?.find(s => s.split === 'train') || splitData.splits?.[0];
   if (!target) throw new Error('Hugging Face tidak menyediakan split yang dapat diimpor untuk dataset ini.');
   const rows = [];
-  for (let offset = 0; offset < limit; offset += 100) {
+  // Ambil seluruh split train. Pagination berhenti hanya saat Hugging Face
+  // tidak lagi mengembalikan baris data.
+  for (let offset = 0; ; offset += 100) {
     const url = new URL('https://datasets-server.huggingface.co/rows');
     url.searchParams.set('dataset', dataset);
     url.searchParams.set('config', target.config);
     url.searchParams.set('split', target.split);
     url.searchParams.set('offset', String(offset));
-    url.searchParams.set('length', String(Math.min(100, limit - offset)));
+    url.searchParams.set('length', '100');
     const response = await fetch(url);
-    if (!response.ok) throw new Error(`Gagal mengambil data Hugging Face pada baris ${offset}. Dataset mungkin gated atau terlalu besar untuk viewer API.`);
+    if (!response.ok) throw new Error(`Gagal mengambil data Hugging Face pada baris ${offset}. Dataset mungkin gated atau viewer API tidak mendukung dataset ini.`);
     const page = await response.json();
     const pageRows = (page.rows || []).map(item => item.row || item);
     rows.push(...pageRows);
@@ -108,7 +109,7 @@ app.post('/api/train', requireAdmin, async (req,res) => { const data=await db();
 app.post('/api/datasets', requireAdmin, upload.single('file'), async (req,res) => { if(!req.file) return res.status(400).json({error:'Pilih file dataset.'}); const ext=path.extname(req.file.originalname).toLowerCase(); if(!['.txt','.md','.csv','.json'].includes(ext)) return res.status(400).json({error:'Format yang didukung: TXT, MD, CSV, JSON.'}); try { const text=await fs.readFile(req.file.path,'utf8'); const entries=toEntries(req.file.originalname,text,ext); if(!entries.length) throw new Error('Tidak ada data valid. CSV/JSON perlu kolom question dan answer (atau pertanyaan dan jawaban).'); const data=await db(); data.entries.push(...entries); data.datasets.unshift({id:id(),name:req.file.originalname,type:ext.slice(1).toUpperCase(),count:entries.length,createdAt:new Date().toISOString()}); data.training={status:'Perlu dilatih ulang',updatedAt:data.training.updatedAt}; await write(DB_FILE,data); res.json({ok:true,count:entries.length}); } catch(e) { res.status(400).json({error:e.message}); } finally { await fs.unlink(req.file.path).catch(()=>{}); } });
 app.post('/api/datasets/huggingface', requireAdmin, async (req,res) => {
   try {
-    const imported = await importHuggingFace(String(req.body.dataset || ''), req.body.limit);
+    const imported = await importHuggingFace(String(req.body.dataset || ''));
     const data = await db();
     data.entries.push(...imported.entries);
     data.datasets.unshift({ id:id(), name:`HF:${imported.dataset}`, type:'HUGGING FACE', count:imported.entries.length, createdAt:new Date().toISOString(), config:imported.config, split:imported.split });

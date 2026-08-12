@@ -6,7 +6,7 @@ MVP chatbot publik dengan panel admin dataset. Modelnya adalah **AI basic dari n
 - Chat publik multi-bahasa
 - Login admin dan pengelolaan dataset
 - Import dataset `CSV`, `JSON`, `TXT`, dan `MD`
-- Import langsung dari link/dataset ID Hugging Face (maksimum 5.000 baris per import agar aman untuk VPS kecil)
+- Import langsung seluruh split `train` dari link/dataset ID Hugging Face dan melatih ulang model secara otomatis
 - Tombol **Latih ulang AI basic** untuk membangun indeks kata dari nol
 - Mencegah jawaban asal: jika relevansi rendah, bot mengaku belum tahu
 - Ekspor pasangan Q&A ke JSONL untuk eksperimen/fine-tuning di Google Colab
