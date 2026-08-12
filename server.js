@@ -50,6 +50,13 @@ function makeIndex(entries) {
   });
   return { df, n, vectors, generatedAt: new Date().toISOString() };
 }
+function isCodeLike(text = '') {
+  const codeSignals = (text.match(/```|\b(def|function|class|import|export|const|let|var|public|private|return|print)\b|[{};]/gi) || []).length;
+  return codeSignals >= 3;
+}
+function isCodingQuestion(text = '') {
+  return /\b(code|coding|kode|program|programming|function|fungsi|script|skrip|debug|bug|error|algorithm|algoritma|api|database|sql|python|java|javascript|typescript|node|react|html|css|git|linux|docker)\b/i.test(text);
+}
 function search(query, data, index) {
   const words = tokenize(query); if (!words.length || !index.vectors?.length) return null;
   const tf = {}; words.forEach(w => tf[w] = (tf[w] || 0) + 1);
@@ -190,6 +197,11 @@ app.post('/api/chat', async (req,res) => {
   const data=await db(), index=await read(INDEX_FILE, {}), result=search(message,data,index);
   if (!result) return res.json({answer:'Saya belum menemukan jawaban yang cukup relevan pada dataset. Coba gunakan pertanyaan coding yang lebih spesifik atau tambahkan dataset yang sesuai.', confidence:0, source:null});
   const e=result.entry; const answer=e.answer || e.content;
+  // Dataset CodeAlpaca banyak completion berupa source code. Jangan kirim hasil itu
+  // untuk pertanyaan umum yang tidak meminta bantuan teknis/coding.
+  if (isCodeLike(answer) && !isCodingQuestion(message)) {
+    return res.json({answer:'Saya belum memiliki jawaban percakapan umum dari dataset yang aktif. Dataset saat ini berisi materi coding, jadi tanyakan topik pemrograman atau import dataset percakapan umum.', confidence:0, source:null});
+  }
   res.json({answer, confidence:Math.round(result.score*100), source:e.source});
 });
 app.post('/api/train', requireAdmin, async (req,res) => { const data=await db(); data.training={status:'Melatih indeks AI...',updatedAt:new Date().toISOString()}; await write(DB_FILE,data); const index=makeIndex(data.entries); await write(INDEX_FILE,index); data.training={status:'Siap digunakan',updatedAt:new Date().toISOString(),model:'TF-IDF retrieval model (from scratch)'}; await write(DB_FILE,data); res.json({ok:true, entries:data.entries.length}); });
